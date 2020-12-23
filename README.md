@@ -59,16 +59,16 @@ mpirun --bind-to core -np 1024  ./osnoise -c 3.0 -t 300 -x 100 -n 31
 
 Options :
 
-flag argument
- -c  float : specifies the compute interval in msec (3.0 msec above)
- -t  int   : specifies the target measurement time in seconds (300 sec above)
- -x  int   : specifies the message size for exchange (100 bytes above)
- -n  int   : specifies the number of histogram bins (31 bins above)
- -m  char  : specifies the communication method (-m [exchange, allreduce, barrier])
- -k  char  : specifies the compute kernel (-k [sqrt, lut])
- -d        : requests a dump of all step times
- -b        : requests an added barrier every 100 steps
- -h        : prints a short help message
+flag argument <br />
+ -c  float : specifies the compute interval in msec (3.0 msec above) <br />
+ -t  int   : specifies the target measurement time in seconds (300 sec above) <br />
+ -x  int   : specifies the message size for exchange (100 bytes above) <br />
+ -n  int   : specifies the number of histogram bins (31 bins above) <br />
+ -m  char  : specifies the communication method (-m [exchange, allreduce, barrier]) <br />
+ -k  char  : specifies the compute kernel (-k [sqrt, lut]) <br />
+ -d        : requests a dump of all step times <br />
+ -b        : requests an added barrier every 100 steps <br />
+ -h        : prints a short help message <br />
 
 With a 3.0 msec time interval for computation, and 100 byte message for exchange,
 the elapsed time should be totally dominated by computation, and the measurement
