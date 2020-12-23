@@ -117,25 +117,25 @@ will inherit the personality setting.  Note that it is not possible to directly 
 the ALSR behavior in the parent process, because that has already been set by Linux.
 An example of a launcher that disables ASLR is shown below:
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/personality.h>
+#include <stdio.h> <br />
+#include <stdlib.h> <br />
+#include <unistd.h> <br />
+#include <sys/personality.h> <br />
 
-int main(int argc, char * argv[])
-{
-  int rc;
+int main(int argc, char * argv[]) <br />
+{ <br />
+  int rc; <br />
 
-  rc = personality(ADDR_NO_RANDOMIZE);
-  if (rc == -1) fprintf(stderr, "personality failed ... not disabling ASLR\n");
+  rc = personality(ADDR_NO_RANDOMIZE); <br />
+  if (rc == -1) fprintf(stderr, "personality failed ... not disabling ASLR\n"); <br />
 
-  rc = execvp(argv[1], &argv[1]);
-  if (rc == -1) {
-    fprintf(stderr, "execvp failed for %s ... exiting\n", argv[1]);
-    exit(0);
-  }
-  return 0;
-}
+  rc = execvp(argv[1], &argv[1]); <br />
+  if (rc == -1) { <br />
+    fprintf(stderr, "execvp failed for %s ... exiting\n", argv[1]); <br />
+    exit(0); <br />
+  } <br />
+  return 0; <br />
+} <br />
 
 Use of such a launcher would be : mpirun ... -np 128 ./launcher  ./your.exe  [program args] .
 
