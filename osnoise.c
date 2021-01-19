@@ -46,7 +46,7 @@ static double * sendn,  * sende,  * sends,  * sendw,  * recvn,  * recve,  * recv
 int main(int argc, char * argv[])
 {
   int i, k, exchbytes, nranks, ch, barrier_flag, help_flag = 0;
-  int iter, maxiter, calib_iters, bin, numbins, method, kernel;
+  int iter, maxiter, calib_iters, bin, numbpd, totbins, method, kernel;
   long npts, context_switches, context_switches_initial;
   long * all_context_switches;
   double  ssum, xtraffic, ytraffic, data_volume, bw;
@@ -60,7 +60,8 @@ int main(int argc, char * argv[])
   double compute_interval_msec;
   double elapsed1, elapsed2, target_measurement_time;
 
-  double histo_bin_width, xhisto, hmin, prob;
+  double histo_bin_width, xhisto, hmin, hmax;
+  double dnumbpd, log10_tmin, log10_tmax, topp, topn, botp, botn, exp1, exp2;
   double tavg, ssq, samples, relative_variation;
   double dev, sigma, scb, sp4, skewness, kurtosis;
   long * histo;
@@ -114,8 +115,8 @@ int main(int argc, char * argv[])
   if (myrank == 0) printf("checking program args ...\n");
 
   // set sensible default values then check program args
-  numbins = 31;
-  compute_interval_msec = 1.0;
+  numbpd = 10;  // number of histogram bins per decade
+  compute_interval_msec = 3.0;
   target_measurement_time = 300.0;  // units of seconds
   exchbytes = 100;
   method = EXCHANGE;
@@ -150,8 +151,8 @@ int main(int argc, char * argv[])
         case 't':  // set the target measurement time in sec
            target_measurement_time = atoi(optarg);
            break;
-        case 'n':  // set the number of histogram bins
-           numbins = atoi(optarg);
+        case 'n':  // set the number of histogram bins per decade
+           numbpd = atoi(optarg);
            break;
         case 'x':  // set the number of bytes for neighbor exchange
            exchbytes = atoi(optarg);
@@ -174,15 +175,16 @@ int main(int argc, char * argv[])
 
   if (myrank == 0) {
      if (method == EXCHANGE) {
-        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, numbins = %d, exchbytes = %d\n",
-                compute_interval_msec, target_measurement_time, numbins, exchbytes);
+        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, exchbytes = %d\n",
+                compute_interval_msec, target_measurement_time, numbpd, exchbytes);
      }
      else {
-        printf("using global collectives : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, numbins = %d\n",
-                compute_interval_msec, target_measurement_time, numbins);
+        printf("using global collectives : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d\n",
+                compute_interval_msec, target_measurement_time, numbpd);
      }
   }
 
+  // choose a 2d decomposition
   npex = (int) (0.1 + sqrt((double) nranks));
   while (nranks % npex != 0) npex++;
   npey = nranks / npex;
@@ -196,7 +198,6 @@ int main(int argc, char * argv[])
 
   if (myrank == 0 && method == EXCHANGE) printf("using npex = %d, npey = %d\n", npex, npey);
 
-  histo = (long *) malloc(numbins*sizeof(long));
   tcomm = (double *) malloc(maxiter*sizeof(double));
   tcomp = (double *) malloc(maxiter*sizeof(double));
   tstep = (double *) malloc(maxiter*sizeof(double));
@@ -384,28 +385,42 @@ int main(int argc, char * argv[])
 
   if (myrank == 0) printf("max communication time in msec = %.3lf\n",  1.0e3*tmax);
 
-  // histogram the data for max communication time per iteration
-  histo_bin_width = (tmax - tmin)/((double) (numbins - 1));
+  // use log-scale binning
+  log10_tmin = log10(tmin);
+  log10_tmax = log10(tmax);
+  
+  dnumbpd = (double) numbpd;
+  botp = floor(log10_tmin);
+  botn = floor(dnumbpd*(log10_tmin - botp));
+  topp = floor(log10_tmax);
+  topn = ceil(dnumbpd*(log10_tmax - topp));
 
-  hmin = tmin - 0.5*histo_bin_width;
+  // total number of histogram bins
+  totbins = (int) round( (dnumbpd*topp + topn) - (dnumbpd*botp + botn) );
 
-  for (bin = 0; bin < numbins; bin++) histo[bin] = 0L;
+  histo = (long *) malloc(totbins*sizeof(long));
+   
+  for (bin = 0; bin < totbins; bin++) histo[bin] = 0L;
 
   for (iter = 0; iter < maxiter; iter++) {
-    if (histo_bin_width > 0.0)  bin = (int) ((tcomm[iter] - hmin)/histo_bin_width);
-    else                        bin = 0;
-    if ((bin >= 0) && (bin < numbins)) histo[bin]++;
+    bin = (int) ( dnumbpd*log10(tcomm[iter]) - (dnumbpd*botp + botn) );
+    if ((bin >= 0) && (bin < totbins)) histo[bin]++;
   }
 
   if (myrank == 0) {
     printf("\n");
-    printf("histogram of max communication times per step\n");
-    printf("      msec       count\n");
-    for (bin = 0; bin < numbins; bin++) {
-      xhisto = tmin + histo_bin_width*((double) bin);
-      printf("%10.3lf  %10ld\n", xhisto*1.0e3, histo[bin]);
+    printf("histogram of max communication times per step, in units of msec\n");
+    printf(" [     min -        max ):      count\n");
+    for (bin = 0; bin < totbins; bin++) {
+      exp1 = botp + (botn + ((double) bin)) / dnumbpd;
+      exp2 = exp1 + 1.0 / dnumbpd;
+      hmin = 1.0e3*pow(10.0, exp1);
+      hmax = 1.0e3*pow(10.0, exp2);
+      printf("%10.3lf - %10.3lf  : %10ld \n", hmin, hmax, histo[bin]);
     }
   }
+
+  free(histo);
 
   // for per-node analysis, focus on the compute times
   compmax = (double *) malloc(maxiter*sizeof(double));
@@ -548,33 +563,48 @@ int main(int argc, char * argv[])
   MPI_Allreduce(MPI_IN_PLACE, &tmin, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &tmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
-  histo_bin_width = (tmax - tmin)/((double) (numbins - 1));
-  hmin = tmin - 0.5*histo_bin_width;
+  // use log-scale binning
+  log10_tmin = log10(tmin);
+  log10_tmax = log10(tmax);
+  
+  dnumbpd = (double) numbpd;
+  botp = floor(log10_tmin);
+  botn = floor(dnumbpd*(log10_tmin - botp));
+  topp = floor(log10_tmax);
+  topn = ceil(dnumbpd*(log10_tmax - topp));
 
-  for (bin = 0; bin < numbins; bin++) histo[bin] = 0;
+  // total number of histogram bins
+  totbins = (int) round( (dnumbpd*topp + topn) - (dnumbpd*botp + botn) );
+
+  histo = (long *) malloc(totbins*sizeof(long));
+   
+  for (bin = 0; bin < totbins; bin++) histo[bin] = 0L;
 
   // each rank histograms its own data
   for (iter = 0; iter < maxiter; iter++) {
-    if (histo_bin_width > 0.0)  bin = (int) ((tstep[iter] - hmin)/histo_bin_width);
-    else                        bin = 0;
-    if ((bin >= 0) && (bin < numbins)) histo[bin]++;
+    bin = (int) ( dnumbpd*log10(tstep[iter]) - (dnumbpd*botp + botn) );
+    if ((bin >= 0) && (bin < totbins)) histo[bin]++;
   }
 
   // for the exchange method, we should sum over all MPI ranks
   if (method == EXCHANGE) {
-     MPI_Allreduce(MPI_IN_PLACE, histo, numbins, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+     MPI_Allreduce(MPI_IN_PLACE, histo, totbins, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
   }
 
   if (myrank == 0) {
-    printf("histogram of step times for all ranks\n");
-    printf("      msec       count               density\n");
-    for (bin = 0; bin < numbins; bin++) {
-      xhisto = tmin + histo_bin_width*((double) bin);
-      prob = 1.0e-3*((double) histo[bin]) / histo_bin_width;
-      printf("%10.3lf  %10ld  %20.4lf\n", xhisto*1.0e3, histo[bin], prob);
+    printf("histogram of step times in msec for all ranks\n");
+    printf(" [     min -        max ):      count\n");
+    for (bin = 0; bin < totbins; bin++) {
+      exp1 = botp + (botn + ((double) bin)) / dnumbpd;
+      exp2 = exp1 + 1.0 / dnumbpd;
+      hmin = 1.0e3*pow(10.0, exp1);
+      hmax = 1.0e3*pow(10.0, exp2);
+      printf("%10.3lf - %10.3lf  : %10ld \n", hmin, hmax, histo[bin]);
     }
     printf("\n");
   }
+
+  free(histo);
 
   // optionally dump data in a single binary file, use floats to save space
   if (dump_data) {
@@ -756,10 +786,10 @@ void compute(int flag, long n, int nrand, double * xrand, double * ssum)
 // -----------------------------------
 void print_help(void)
 {
-   printf("Syntax: mpirun -np #ranks osnoise [-c compute_interval_msec] [-t target_measurement_time] [-n numbins] [-x exchbytes] [-m method] [-k kernel] [-d] [-b]\n");
+   printf("Syntax: mpirun -np #ranks osnoise [-c compute_interval_msec] [-t target_measurement_time] [-n histogram_bins_per_decade] [-x exchbytes] [-m method] [-k kernel] [-d] [-b]\n");
    printf(" -c float ... specifies the compute interval in milliseconds\n");
    printf(" -t int   ... specifies the target measurement time in units of seconds\n");
-   printf(" -n int   ... specifies the number of histogram bins\n");
+   printf(" -n int   ... specifies the number of histogram bins per decade\n");
    printf(" -x int   ... specifies the message size in bytes used for neighbor exchange\n");
    printf(" -m char  ... specifies the communication method (values : exchange, allreduce, barrier)\n");
    printf(" -k char  ... specifies the compute kernel (values : sqrt, lut)\n");
