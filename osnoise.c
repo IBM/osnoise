@@ -21,6 +21,7 @@
 #define BARRIER   10
 #define EXCHANGE  11
 #define ALLREDUCE 12
+#define ALLTOALL  13
 
 #define SORT_ASCENDING_ORDER   1
 #define SORT_DESCENDING_ORDER -1
@@ -37,7 +38,7 @@ void print_help(void);
 
 void sortx(double *, int, int *, int);
 
-static int myrank, myrow, mycol, npex, npey, exchcount;
+static int myrank, myrow, mycol, npex, npey, dblcount;
 
 static double * sendn,  * sende,  * sends,  * sendw,  * recvn,  * recve,  * recvs,  * recvw;
 
@@ -45,13 +46,13 @@ static double * sendn,  * sende,  * sends,  * sendw,  * recvn,  * recve,  * recv
 
 int main(int argc, char * argv[])
 {
-  int i, k, exchbytes, nranks, ch, barrier_flag, help_flag = 0;
+  int i, k, msgsize, nranks, ch, barrier_flag, help_flag = 0;
   int iter, maxiter, calib_iters, bin, numbpd, totbins, method, kernel;
   long npts, context_switches, context_switches_initial;
   long * all_context_switches;
   double  ssum, xtraffic, ytraffic, data_volume, bw;
   double  t1, t2, t3, tmin, tmax, delay;
-  double * xrand;
+  double * sbuf, * rbuf, * xrand;
   int nrand = 1000;
   int local_rank, ranks_per_node;
   MPI_Comm local_comm;
@@ -92,7 +93,7 @@ int main(int argc, char * argv[])
   char * time_string;
   FILE * ofp;
   MPI_Status status;
-  MPI_Comm node_comm;
+  MPI_Comm node_comm, column_comm;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
@@ -118,7 +119,7 @@ int main(int argc, char * argv[])
   numbpd = 10;  // number of histogram bins per decade
   compute_interval_msec = 3.0;
   target_measurement_time = 300.0;  // units of seconds
-  exchbytes = 100;
+  msgsize = 100;
   method = EXCHANGE;
   kernel = 0;
   dump_data = 0;
@@ -137,8 +138,9 @@ int main(int argc, char * argv[])
         case 'c':  // set the compute interval in msec
            compute_interval_msec = (double) atof(optarg);
            break;
-        case 'm':  // choose the comunication method : barrier or exchange
+        case 'm':  // choose the comunication method : barrier, allreduce, alltoall, or exchange
            if (0 == strncasecmp(optarg, "barrier", 7))        method = BARRIER;
+           else if (0 == strncasecmp(optarg, "alltoall", 8))  method = ALLTOALL;
            else if (0 == strncasecmp(optarg, "allreduce", 9)) method = ALLREDUCE;
            else if (0 == strncasecmp(optarg, "exchange", 8))  method = EXCHANGE;
            else                                               method = EXCHANGE;
@@ -154,8 +156,8 @@ int main(int argc, char * argv[])
         case 'n':  // set the number of histogram bins per decade
            numbpd = atoi(optarg);
            break;
-        case 'x':  // set the number of bytes for neighbor exchange
-           exchbytes = atoi(optarg);
+        case 'x':  // set the number of bytes for neighbor exchange or alltoall
+           msgsize = atoi(optarg);
            break;
         case 'd':  // optionally dump all timing data
            dump_data = 1;
@@ -175,8 +177,12 @@ int main(int argc, char * argv[])
 
   if (myrank == 0) {
      if (method == EXCHANGE) {
-        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, exchbytes = %d\n",
-                compute_interval_msec, target_measurement_time, numbpd, exchbytes);
+        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d\n",
+                compute_interval_msec, target_measurement_time, numbpd, msgsize);
+     }
+     else if (method == ALLTOALL) {
+        printf("using alltoall on columns : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d\n",
+                compute_interval_msec, target_measurement_time, numbpd, msgsize);
      }
      else {
         printf("using global collectives : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d\n",
@@ -189,37 +195,52 @@ int main(int argc, char * argv[])
   while (nranks % npex != 0) npex++;
   npey = nranks / npex;
 
-  exchcount = exchbytes / sizeof(double);
+  dblcount = msgsize / sizeof(double);
 
   mycol = myrank % npex;
   myrow = myrank / npex;
 
+  if (method == ALLTOALL) {
+     color = mycol;
+     key = myrank;
+     MPI_Comm_split(MPI_COMM_WORLD, color, key, &column_comm);
+  }
+
   if (myrank == 0) printf("starting with nranks = %d\n", nranks);
 
-  if (myrank == 0 && method == EXCHANGE) printf("using npex = %d, npey = %d\n", npex, npey);
+  if (myrank == 0) { 
+     if ( (method == EXCHANGE) || (method == ALLTOALL) )  printf("using npex = %d, npey = %d\n", npex, npey);
+  }
 
   tcomm = (double *) malloc(maxiter*sizeof(double));
   tcomp = (double *) malloc(maxiter*sizeof(double));
   tstep = (double *) malloc(maxiter*sizeof(double));
 
-  sendn = (double *) malloc(exchbytes);
-  sends = (double *) malloc(exchbytes);
-  sende = (double *) malloc(exchbytes);
-  sendw = (double *) malloc(exchbytes);
-  recvn = (double *) malloc(exchbytes);
-  recvs = (double *) malloc(exchbytes);
-  recve = (double *) malloc(exchbytes);
-  recvw = (double *) malloc(exchbytes);
+  sendn = (double *) malloc(msgsize);
+  sends = (double *) malloc(msgsize);
+  sende = (double *) malloc(msgsize);
+  sendw = (double *) malloc(msgsize);
+  recvn = (double *) malloc(msgsize);
+  recvs = (double *) malloc(msgsize);
+  recve = (double *) malloc(msgsize);
+  recvw = (double *) malloc(msgsize);
 
-  for (i = 0; i< exchcount; i++) sendn[i] = (double) myrank;
-  for (i = 0; i< exchcount; i++) sends[i] = (double) myrank;
-  for (i = 0; i< exchcount; i++) sende[i] = (double) myrank;
-  for (i = 0; i< exchcount; i++) sendw[i] = (double) myrank;
+  for (i = 0; i< dblcount; i++) sendn[i] = (double) myrank;
+  for (i = 0; i< dblcount; i++) sends[i] = (double) myrank;
+  for (i = 0; i< dblcount; i++) sende[i] = (double) myrank;
+  for (i = 0; i< dblcount; i++) sendw[i] = (double) myrank;
 
-  for (i = 0; i< exchcount; i++) recvn[i] = 0.0;
-  for (i = 0; i< exchcount; i++) recvs[i] = 0.0;
-  for (i = 0; i< exchcount; i++) recve[i] = 0.0;
-  for (i = 0; i< exchcount; i++) recvw[i] = 0.0;
+  for (i = 0; i< dblcount; i++) recvn[i] = 0.0;
+  for (i = 0; i< dblcount; i++) recvs[i] = 0.0;
+  for (i = 0; i< dblcount; i++) recve[i] = 0.0;
+  for (i = 0; i< dblcount; i++) recvw[i] = 0.0;
+
+  if (method == ALLTOALL) {
+     sbuf = (double *) malloc(msgsize*npey);
+     rbuf = (double *) malloc(msgsize*npey);
+     for (i = 0; i< dblcount*npey; i++) sbuf[i] = (double) myrank;
+     for (i = 0; i< dblcount*npey; i++) rbuf[i] = 0.0;
+  }
 
   xrand = (double *) malloc(nrand*sizeof(double));
 
@@ -239,6 +260,7 @@ int main(int argc, char * argv[])
   ssum += 1.0;
 
   if (method == EXCHANGE)       exch(0);
+  else if (method == ALLTOALL)  MPI_Alltoall(sbuf, dblcount, MPI_DOUBLE, rbuf, dblcount, MPI_DOUBLE, column_comm);
   else if (method == ALLREDUCE) MPI_Allreduce(MPI_IN_PLACE, &ssum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   else                          MPI_Barrier(MPI_COMM_WORLD);
 
@@ -311,6 +333,7 @@ int main(int argc, char * argv[])
     ssum += 1.0;
     t2 = MPI_Wtime();
     if (method == EXCHANGE)       exch(iter);
+    else if (method == ALLTOALL)  MPI_Alltoall(sbuf, dblcount, MPI_DOUBLE, rbuf, dblcount, MPI_DOUBLE, column_comm);
     else if (method == ALLREDUCE) MPI_Allreduce(MPI_IN_PLACE, &ssum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     else                          MPI_Barrier(MPI_COMM_WORLD);
     t3 = MPI_Wtime();
@@ -372,9 +395,9 @@ int main(int argc, char * argv[])
 
   // data volume per node (most of this is likely to stay on-node)
   if (npex == 1) xtraffic = 0.0;
-  else           xtraffic = (double) ( (4*(npex - 2) + 2)*npey ) * ((double) exchbytes);
+  else           xtraffic = (double) ( (4*(npex - 2) + 2)*npey ) * ((double) msgsize);
   if (npey == 1) ytraffic = 0.0;
-  else           ytraffic = (double) ( (4*(npey - 2) + 2)*npex ) * ((double) exchbytes);
+  else           ytraffic = (double) ( (4*(npey - 2) + 2)*npex ) * ((double) msgsize);
   data_volume = (xtraffic + ytraffic) / ((double) num_nodes);
 
   tmax = 0.0; tmin = 1.0e30;
@@ -509,7 +532,7 @@ int main(int argc, char * argv[])
      if (tstep[iter] < tmin) tmin = tstep[iter];
   }
 
-  if (method != EXCHANGE) {
+  if ( (method == ALLREDUCE) || (method == BARRIER) ) {
      // in this case there is just one step time per iteration, the same for all ranks
      tavg = (elapsed2 - elapsed1) / ((double) maxiter);
      
@@ -586,8 +609,8 @@ int main(int argc, char * argv[])
     if ((bin >= 0) && (bin < totbins)) histo[bin]++;
   }
 
-  // for the exchange method, we should sum over all MPI ranks
-  if (method == EXCHANGE) {
+  // for the exchange or alltoall methods, we should sum over all MPI ranks
+  if ( (method == EXCHANGE) || (method == ALLTOALL) ) {
      MPI_Allreduce(MPI_IN_PLACE, histo, totbins, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
   }
 
@@ -713,36 +736,36 @@ void exch(int iter)
   // exchange data with partner to the north
   if (myrow != (npey - 1)) {
     north = myrank + npex;
-    MPI_Irecv(recvn, exchcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Irecv(recvn, dblcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
-    MPI_Isend(sendn, exchcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Isend(sendn, dblcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
   }
 
   // exchange data with partner to the east
   if (mycol != (npex - 1)) {
     east = myrank + 1;
-    MPI_Irecv(recve, exchcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Irecv(recve, dblcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
-    MPI_Isend(sende, exchcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Isend(sende, dblcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
   }
 
   // exchange data with partner to the south
   if (myrow != 0) {
     south = myrank - npex;
-    MPI_Irecv(recvs, exchcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Irecv(recvs, dblcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
-    MPI_Isend(sends, exchcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Isend(sends, dblcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
   }
 
   // exchange data with partner to the west
   if (mycol != 0) {
     west = myrank - 1;
-    MPI_Irecv(recvw, exchcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Irecv(recvw, dblcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
-    MPI_Isend(sendw, exchcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
+    MPI_Isend(sendw, dblcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
     ireq = ireq + 1;
   }
 
@@ -786,12 +809,12 @@ void compute(int flag, long n, int nrand, double * xrand, double * ssum)
 // -----------------------------------
 void print_help(void)
 {
-   printf("Syntax: mpirun -np #ranks osnoise [-c compute_interval_msec] [-t target_measurement_time] [-n histogram_bins_per_decade] [-x exchbytes] [-m method] [-k kernel] [-d] [-b]\n");
+   printf("Syntax: mpirun -np #ranks osnoise [-c compute_interval_msec] [-t target_measurement_time] [-n histogram_bins_per_decade] [-x msgsize] [-m method] [-k kernel] [-d] [-b]\n");
    printf(" -c float ... specifies the compute interval in milliseconds\n");
    printf(" -t int   ... specifies the target measurement time in units of seconds\n");
    printf(" -n int   ... specifies the number of histogram bins per decade\n");
-   printf(" -x int   ... specifies the message size in bytes used for neighbor exchange\n");
-   printf(" -m char  ... specifies the communication method (values : exchange, allreduce, barrier)\n");
+   printf(" -x int   ... specifies the message size in bytes used for neighbor exchange or alltoall\n");
+   printf(" -m char  ... specifies the communication method (values : exchange, alltoall, allreduce, barrier)\n");
    printf(" -k char  ... specifies the compute kernel (values : sqrt, lut)\n");
    printf(" -d       ... sets flag to dump data to a file\n");
    printf(" -b       ... sets flag to add a barrier every 100 iterations of the (compute, communicate) loop\n");    
