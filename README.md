@@ -25,7 +25,8 @@ ETH, for operating system noise measurement.  The current project was developed
 independently.  It uses a calibrated sequence of steps, where each step consists of
 a compute phase followed by MPI communication.  The default communication pattern
 is nearest-neighbor boundary exchange on a 2D Cartesian process grid.  One can
-optionally choose a globally synchronizing MPI call, MPI_Allreduce or MPI_Barrier,
+optionally choose MPI_Alltoall using column communicators on the 2D process grid,
+or globally synchronizing MPI calls, MPI_Allreduce or MPI_Barrier,
 after every computation step.  Message sizes can be specified at run time via command
 line arguments.  The use of MPI at each step ensures that this benchmark is very
 similar to many real-world simulations.  The MPI connections make the benchmark
@@ -62,9 +63,9 @@ Options :
 flag argument <br />
  -c  float : specifies the compute interval in msec (3.0 msec above) <br />
  -t  int   : specifies the target measurement time in seconds (300 sec above) <br />
- -x  int   : specifies the message size for exchange (100 bytes above) <br />
+ -x  int   : specifies the message size for exchange or alltoall (100 bytes above) <br />
  -n  int   : specifies the number of histogram bins (31 bins above) <br />
- -m  char  : specifies the communication method (-m [exchange, allreduce, barrier]) <br />
+ -m  char  : specifies the communication method (-m [exchange, alltoall, allreduce, barrier]) <br />
  -k  char  : specifies the compute kernel (-k [sqrt, lut]) <br />
  -d        : requests a dump of all step times <br />
  -b        : requests an added barrier every 100 steps <br />
