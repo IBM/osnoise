@@ -362,7 +362,7 @@ int main(int argc, char * argv[])
   MPI_Allreduce(&sum_comm, &avgMPI, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   avgMPI = avgMPI / ((double) nranks);
 
-  // after this call, tcomm holds the max time in MPI over all steps for each rank
+  // after this call, tcomm holds the max time in MPI over all ranks for each step
   MPI_Allreduce(MPI_IN_PLACE, tcomm, maxiter, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
   // compute mean and relative variation rank by rank
