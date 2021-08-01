@@ -26,8 +26,6 @@
 #define SORT_ASCENDING_ORDER   1
 #define SORT_DESCENDING_ORDER -1
 
-void get_local_communicator(int *, int *, MPI_Comm *);
-
 void compute(int, long, int, double *, double *);
 
 double lutexp(double);
@@ -60,6 +58,7 @@ int main(int argc, char * argv[])
   double * tcomm, * tcomp, * tstep;
   double compute_interval_msec;
   double elapsed1, elapsed2, target_measurement_time;
+  char format[160], hfmt[8], heading[160];
 
   double histo_bin_width, xhisto, hmin, hmax;
   double dnumbpd, log10_tmin, log10_tmax, topp, topn, botp, botn, exp1, exp2;
@@ -74,7 +73,7 @@ int main(int argc, char * argv[])
   struct minStruct myMPI, minMPI;
   double avgMPI;
   int mycpu, * all_cpus;
-
+  int hostlen, maxlen;
   char host[80], * ptr, * snames, * rnames;
   int * sort_key;
   int num_nodes, color, key;
@@ -104,8 +103,10 @@ int main(int argc, char * argv[])
   time_string = ctime(&current_time);
   if (myrank == 0) fprintf(stderr, "starting time : %s\n", time_string);
 
-  get_local_communicator(&ranks_per_node, &local_rank, &local_comm);
-
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, myrank, MPI_INFO_NULL, &local_comm);
+  MPI_Comm_size(local_comm, &ranks_per_node);
+  MPI_Comm_rank(local_comm, &local_rank);
+  
   num_nodes = nranks / ranks_per_node;
 
   // create a communicator for collecting data across nodes
@@ -478,6 +479,18 @@ int main(int argc, char * argv[])
 
   sigma_comp = sqrt(compssq/((double) maxiter));
 
+  gethostname(host, sizeof(host));
+
+  for (i=0; i<sizeof(host); i++) {    
+     if (host[i] == '.') {
+        host[i] = '\0';
+        break;
+     }
+  }
+
+  hostlen = strlen(host);
+  MPI_Allreduce(&hostlen, &maxlen, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
   if (local_rank == 0) {
 
      aggregate_sigma_comp = (double *) malloc(num_nodes*sizeof(double));
@@ -490,15 +503,6 @@ int main(int argc, char * argv[])
      rnames = (char *) malloc(num_nodes*sizeof(host));
      sort_key = (int *) malloc(num_nodes*sizeof(int));
 
-     gethostname(host, sizeof(host));
-
-     for (i=0; i<sizeof(host); i++) {    
-        if (host[i] == '.') {
-           host[i] = '\0';
-           break;
-        }
-     }
-
      for (i=0; i<num_nodes; i++)  {
        ptr = snames + i*sizeof(host);
        strncpy(ptr, host, sizeof(host));
@@ -510,19 +514,30 @@ int main(int argc, char * argv[])
      // aggregate_sigma_comp is returned in sorted order, along with the sort key
      sortx(aggregate_sigma_comp, num_nodes, sort_key, SORT_DESCENDING_ORDER);
 
+     sprintf(hfmt, "%%%ds", maxlen);
+     sprintf(heading, hfmt, "host");
+     strcat(heading, "         mean(msec)    percent variation\n");
+     printf(heading);
+     sprintf(format, "%%%ds    %10.3lf    %10.3lf", maxlen);
+     strcat(format, "\n");
+
      if (myrank == 0) {
         printf("\n");
         printf(" percent variation = 100*sigma/mean for the max computation times per step by node:\n");
-        printf("              host         mean(msec)    percent variation\n");
+        printf(heading);
         for (i=0; i< num_nodes; i++) {
            k = sort_key[i];
            ptr = rnames + k*sizeof(host);
            relative_variation = 100.0*aggregate_sigma_comp[i] / aggregate_compavg[k];
-           printf("%18s    %10.3lf    %10.3lf\n", ptr, 1.0e3*aggregate_compavg[k], relative_variation);
+           printf(format, ptr, 1.0e3*aggregate_compavg[k], relative_variation);
         }
         printf("\n");
      }
   }
+
+  memset(hfmt, '\0', sizeof(hfmt));
+  memset(heading, '\0', sizeof(heading));
+  memset(format, '\0', sizeof(format));
   
 
   // analyze all step time data for all ranks
@@ -704,12 +719,16 @@ int main(int argc, char * argv[])
     printf("avg MPI time = %.3lf sec\n", avgMPI);
     printf("\n");
     printf("avg compute interval (msec), percent relative variation of compute times, and total communication time (sec) by rank:\n");
-    printf("  rank             host      cpu  avg_comp(msec)    %%reldev   total_comm(sec)   user_time(sec)   switches\n");
+    sprintf(hfmt, "%%s %%%ds", maxlen);
+    sprintf(heading, hfmt, "  rank", "host");
+    strcat(heading, "    cpu  avg_comp(msec)    %%reldev   total_comm(sec)   user_time(sec)   switches\n");
+    printf(heading);
+    sprintf(format, "%%6d %%%ds %%6d %%14.3lf  %%10.2lf %%16.3lf %%16.3lf %%11ld", maxlen);
+    strcat(format, "\n");
     for (i=0; i<nranks; i++) {
        k = i / ranks_per_node;
        ptr = rnames + k*sizeof(host);
-       printf("%6d %18s %6d %14.3lf  %10.2lf %16.3lf %16.3lf %11ld\n", 
-               i, ptr, all_cpus[i], 1.0e3*allavg_comp[i], alldev_comp[i], allsum_comm[i], allusr_time[i], all_context_switches[i]);
+       printf(format, i, ptr, all_cpus[i], 1.0e3*allavg_comp[i], alldev_comp[i], allsum_comm[i], allusr_time[i], all_context_switches[i]);
     }
     printf("\n");
   }
@@ -820,57 +839,6 @@ void print_help(void)
    printf(" -b       ... sets flag to add a barrier every 100 iterations of the (compute, communicate) loop\n");    
 }
 
-
-void get_local_communicator(int * ppn, int * prank, MPI_Comm * pcomm)
-{
-  int i, myrank, nranks;
-  char * ptr, * snames, * rnames, host[80];
-  int match, color;
-  int local_rank, ranks_per_node;
-  MPI_Comm local_comm;
-
-  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-
-  // make a communicator of all ranks on this node
-  snames = (char *) malloc(nranks*sizeof(host));
-  rnames = (char *) malloc(nranks*sizeof(host));
-  gethostname(host, sizeof(host));
-
-  for (i=0; i<sizeof(host); i++) {    
-     if (host[i] == '.') {
-         host[i] = '\0';
-         break;
-     }
-  }
-
-  for (i=0; i<nranks; i++)  {
-    ptr = snames + i*sizeof(host);
-    strncpy(ptr, host, sizeof(host));
-  }
-
-  MPI_Alltoall(snames, sizeof(host), MPI_BYTE,
-               rnames, sizeof(host), MPI_BYTE, MPI_COMM_WORLD);
-  color = 0;
-  match = 0;
-  for (i=0; i<nranks; i++) {
-    ptr = rnames + i*sizeof(host);
-    if (strcmp(host, ptr) == 0) {    
-      match++;
-      if (match == 1) color = i;
-    }
-  }
-
-  MPI_Comm_split(MPI_COMM_WORLD, color, myrank, &local_comm);
-  MPI_Comm_rank(local_comm, &local_rank);
-  MPI_Comm_size(local_comm, &ranks_per_node);
-
-  *ppn = ranks_per_node;
-  *prank = local_rank;
-  *pcomm = local_comm;
-
-  return;
-}
 
 //===========================================================================
 // incremental Shell sort with increment array: inc[k] = 1 + 3*2^k + 4^(k+1) 
