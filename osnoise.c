@@ -518,7 +518,7 @@ int main(int argc, char * argv[])
      sprintf(heading, hfmt, "host");
      strcat(heading, "         mean(msec)    percent variation\n");
      printf(heading);
-     sprintf(format, "%%%ds    %10.3lf    %10.3lf", maxlen);
+     sprintf(format, "%%%ds    %%10.3lf    %%10.3lf", maxlen);
      strcat(format, "\n");
 
      if (myrank == 0) {
