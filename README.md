@@ -7,7 +7,7 @@ Quick start :
 
   (2) make
 
-  (3) mpirun --bind-to core -np 1024  ./osnoise -c 3.0 -t 300 -x 100 -n 31
+  (3) mpirun --bind-to core -np 1024  ./osnoise -c 3.0 -t 300 -x 100 -n 10
 
   (4) inspect output, including the reported parallel efficiency
 
