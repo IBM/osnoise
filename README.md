@@ -56,7 +56,7 @@ computation interval.
 
 It is often desirable to place one MPI rank on each core, and use options like these :
 
-mpirun --bind-to core -np 1024  ./osnoise -c 3.0 -t 300 -x 100 -n 31
+mpirun --bind-to core -np 1024  ./osnoise -c 3.0 -t 300 -x 100  -n 10
 
 Options :
 
@@ -64,7 +64,7 @@ flag argument <br />
  -c  float : specifies the compute interval in msec (3.0 msec above) <br />
  -t  int   : specifies the target measurement time in seconds (300 sec above) <br />
  -x  int   : specifies the message size for exchange or alltoall (100 bytes above) <br />
- -n  int   : specifies the number of histogram bins (31 bins above) <br />
+ -n  int   : specifies the number of histogram bins (10 bins above is the default choice) <br />
  -m  char  : specifies the communication method (-m [exchange, alltoall, allreduce, barrier]) <br />
  -k  char  : specifies the compute kernel (-k [sqrt, lut]) <br />
  -d        : requests a dump of all step times <br />
