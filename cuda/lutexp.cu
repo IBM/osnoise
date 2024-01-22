@@ -23,11 +23,8 @@
 #include <math.h>
 #include "lutexp.h"
 
-#ifdef GPU
 __device__ double gpu_lutexp(double x)
-#else
-double lutexp(double x)
-#endif
+
 {
    int hind;
    double result, hfactor;

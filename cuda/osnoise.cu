@@ -17,46 +17,45 @@
 #include <unistd.h>
 #include <time.h>
 #include <sched.h>
-#ifdef GPU
 #include <cuda_runtime.h>
+#include <nccl.h>
 #include <nvml.h>
-#endif
 
 #define BARRIER   10
 #define EXCHANGE  11
 #define ALLREDUCE 12
-#define ALLTOALL  13
 
 #define SORT_ASCENDING_ORDER   1
 #define SORT_DESCENDING_ORDER -1
 
-#ifdef GPU
 #define MAX_BLOCKS 512
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 32
 #define NUM_WARPS THREADS_PER_BLOCK/WARP_SIZE
 #define CUDA_RC(rc) if( (rc) != cudaSuccess ) \
   {fprintf(stderr, "Error %s at %s line %d\n", cudaGetErrorString(cudaGetLastError()), __FILE__,__LINE__); MPI_Abort(MPI_COMM_WORLD, 1);}
-#endif
+#define CUDA_CHECK()  if( (cudaPeekAtLastError()) != cudaSuccess )        \
+  {fprintf(stderr, "Error %s at %s line %d\n", cudaGetErrorString(cudaGetLastError()), __FILE__,__LINE__-1); MPI_Abort(MPI_COMM_WORLD, 1);}
+#define NCCL_RC(rc) if( (rc) != ncclSuccess ) \
+  {fprintf(stderr, "Error %s at %s line %d\n", ncclGetErrorString(rc), __FILE__,__LINE__); MPI_Abort(MPI_COMM_WORLD, 1);}
 
-#ifdef GPU
+__global__ void gpuFill(float alpha, float * x, int nfloats)
+{
+   for (int i = blockDim.x * blockIdx.x + threadIdx.x;  i < nfloats; i += blockDim.x * gridDim.x) x[i] = alpha;
+}
+
 __global__ void gpu_compute(int, long, int, double *, double *);
 __device__ double gpu_lutexp(double);
 __host__ void exch(int);
 __host__ void print_help(void);
 __host__ void sortx(double *, int, int *, int);
-#else
-void compute(int, long, int, double *, double *);
-double lutexp(double);
-void exch(int);
-void print_help(void);
-void sortx(double *, int, int *, int);
-#endif
 
-static int myrank, myrow, mycol, npex, npey, dblcount;
+static int myrank, myrow, mycol, npex, npey;
 
-static double * sendn,  * sende,  * sends,  * sendw,  * recvn,  * recve,  * recvs,  * recvw;
-
+static ncclComm_t nccl_comm;
+static cudaStream_t stream;
+static float * sbuf, * rbuf,* hbuf;
+static int nfloats, xfersize;
 
 
 int main(int argc, char * argv[])
@@ -67,7 +66,7 @@ int main(int argc, char * argv[])
   long * all_context_switches;
   double  ssum, xtraffic, ytraffic, data_volume, bw;
   double  t1, t2, t3, tmin, tmax;
-  double * sbuf, * rbuf, * xrand;
+  double * xrand;
   int nrand = 1000;
   int local_rank, ranks_per_node;
   MPI_Comm local_comm;
@@ -94,6 +93,7 @@ int main(int argc, char * argv[])
   char host[80], * ptr, * snames, * rnames;
   int * sort_key;
   int num_nodes, color, key;
+  float alpha;
   double * compmax, compmin, compavg, compssq;
   double sigma_comp, samples_total;
   double * aggregate_sigma_comp, * aggregate_compavg;
@@ -109,15 +109,14 @@ int main(int argc, char * argv[])
   char * time_string;
   FILE * ofp;
   MPI_Status status;
-  MPI_Comm node_comm, column_comm;
-#ifdef GPU
-  int numDevices, myDevice, gpu, sleep_microsec;
+  MPI_Comm node_comm;
+  int numDevices, myDevice, gpu, sleep_microsec, version;
   double * block_data, * dev_xrand, * dev_block_data;
   unsigned int temperature, power, smMHz;
   nvmlDevice_t nvmldevice, * device;
   unsigned int device_count;
   int nvml_iter, * alltemp, * allpower, * allfreq;
-#endif
+  ncclUniqueId nccl_id;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
@@ -127,13 +126,6 @@ int main(int argc, char * argv[])
   current_time = time(NULL);
   time_string = ctime(&current_time);
   if (myrank == 0) fprintf(stderr, "starting time : %s\n", time_string);
-
-#ifdef GPU
-  // each MPI rank selects a device
-  CUDA_RC(cudaGetDeviceCount(&numDevices));
-  myDevice = myrank % numDevices;
-  CUDA_RC(cudaSetDevice(myDevice));
-#endif
 
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, myrank, MPI_INFO_NULL, &local_comm);
   MPI_Comm_size(local_comm, &ranks_per_node);
@@ -152,18 +144,15 @@ int main(int argc, char * argv[])
   numbpd = 10;  // number of histogram bins per decade
   compute_interval_msec = 3.0;
   target_measurement_time = 300.0;  // units of seconds
-  msgsize = 100;
+  msgsize = 1000000;
+  xfersize = 100000;
   method = EXCHANGE;
-#ifdef GPU
   kernel = 1;
-#else
-  kernel = 0;
-#endif
   dump_data = 0;
   barrier_flag = 0;
 
   while (1) {
-     ch = getopt(argc, argv, "hm:c:t:n:x:k:db");
+     ch = getopt(argc, argv, "hm:c:t:n:s:x:k:db");
      if (ch == -1) break;
      switch (ch) {
         case 'h':
@@ -175,10 +164,9 @@ int main(int argc, char * argv[])
         case 'c':  // set the compute interval in msec
            compute_interval_msec = (double) atof(optarg);
            break;
-        case 'm':  // choose the comunication method : barrier, allreduce, alltoall, or exchange
-           if (0 == strncasecmp(optarg, "barrier", 7))        method = BARRIER;
-           else if (0 == strncasecmp(optarg, "alltoall", 8))  method = ALLTOALL;
-           else if (0 == strncasecmp(optarg, "allreduce", 9)) method = ALLREDUCE;
+        case 'm':  // choose the comunication method : allreduce or exchange
+           if      (0 == strncasecmp(optarg, "allreduce", 9)) method = ALLREDUCE;
+           else if (0 == strncasecmp(optarg, "barrier", 8))   method = BARRIER;
            else if (0 == strncasecmp(optarg, "exchange", 8))  method = EXCHANGE;
            else                                               method = EXCHANGE;
            break;
@@ -192,8 +180,11 @@ int main(int argc, char * argv[])
         case 'n':  // set the number of histogram bins per decade
            numbpd = atoi(optarg);
            break;
-        case 'x':  // set the number of bytes for neighbor exchange or alltoall
+        case 's':  // set the size in bytes for neighbor exchange or allreduce
            msgsize = atoi(optarg);
+           break;
+        case 'x':  // set the size in bytes for device to host transfer
+           xfersize = atoi(optarg);
            break;
         case 'd':  // optionally dump all timing data
            dump_data = 1;
@@ -205,13 +196,46 @@ int main(int argc, char * argv[])
 
   maxiter = (int) (1.0e3 * target_measurement_time / compute_interval_msec );
 
+  nfloats = msgsize / sizeof(float);
+
   if (help_flag) {
      if (myrank == 0) print_help();
      MPI_Finalize();
      return 0;
   }
 
-#ifdef GPU
+  // each MPI rank selects a device
+  CUDA_RC(cudaGetDeviceCount(&numDevices));
+  myDevice = myrank % numDevices;
+  CUDA_RC(cudaSetDevice(myDevice));
+  MPI_Barrier(MPI_COMM_WORLD);
+  if (myrank == 0) ncclGetUniqueId(&nccl_id);
+  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+  if (myrank < numDevices) fprintf(stderr, "rank %d has device %d\n", myrank, myDevice);
+
+  NCCL_RC(ncclGetVersion(&version));
+  if (myrank == 0) fprintf(stderr, "NCCL version = %d\n", version);
+
+  NCCL_RC(ncclCommInitRank(&nccl_comm, nranks, nccl_id, myrank));
+
+  CUDA_RC(cudaMalloc((void **)&sbuf, nfloats*sizeof(float)));
+  CUDA_RC(cudaMalloc((void **)&rbuf, nfloats*sizeof(float)));
+  CUDA_RC(cudaMallocHost((void **)&hbuf, nfloats*sizeof(float)));
+  CUDA_RC(cudaStreamCreate(&stream));
+
+  int threadsPerBlock = THREADS_PER_BLOCK;
+  int numBlocks = (nfloats + threadsPerBlock - 1) / ((long) threadsPerBlock);
+  if (numBlocks > MAX_BLOCKS) numBlocks = MAX_BLOCKS;
+
+  alpha = (float) myrank;
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  gpuFill<<<numBlocks, threadsPerBlock>>>(alpha, sbuf, nfloats);
+  CUDA_CHECK();
+  CUDA_RC(cudaDeviceSynchronize());
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
   if (NVML_SUCCESS != nvmlInit()) {
      fprintf(stderr, "failed to initialize NVML ... exiting\n");
      MPI_Abort(MPI_COMM_WORLD, 1);
@@ -235,20 +259,15 @@ int main(int argc, char * argv[])
   nvmldevice = device[myDevice];
 
   sleep_microsec = (int) (0.8*compute_interval_msec * 1.0e3);
-#endif
 
   if (myrank == 0) {
      if (method == EXCHANGE) {
-        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d\n",
-                compute_interval_msec, target_measurement_time, numbpd, msgsize);
-     }
-     else if (method == ALLTOALL) {
-        printf("using alltoall on columns : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d\n",
-                compute_interval_msec, target_measurement_time, numbpd, msgsize);
+        printf("using neighbor exchange : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d, xfersize = %d\n",  
+                compute_interval_msec, target_measurement_time, numbpd, msgsize, xfersize);
      }
      else {
-        printf("using global collectives : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d\n",
-                compute_interval_msec, target_measurement_time, numbpd);
+        printf("using global collectives : compute_interval_msec = %.2lf, target measurement time = %.1lf sec, bins_per_decade = %d, msgsize = %d, xfersize = %d\n",
+                compute_interval_msec, target_measurement_time, numbpd, msgsize, xfersize);
      }
   }
 
@@ -257,52 +276,18 @@ int main(int argc, char * argv[])
   while (nranks % npex != 0) npex++;
   npey = nranks / npex;
 
-  dblcount = msgsize / sizeof(double);
-
   mycol = myrank % npex;
   myrow = myrank / npex;
-
-  if (method == ALLTOALL) {
-     color = mycol;
-     key = myrank;
-     MPI_Comm_split(MPI_COMM_WORLD, color, key, &column_comm);
-  }
 
   if (myrank == 0) printf("starting with nranks = %d\n", nranks);
 
   if (myrank == 0) { 
-     if ( (method == EXCHANGE) || (method == ALLTOALL) )  printf("using npex = %d, npey = %d\n", npex, npey);
+     if (method == EXCHANGE) printf("using npex = %d, npey = %d\n", npex, npey);
   }
 
   tcomm = (double *) malloc(maxiter*sizeof(double));
   tcomp = (double *) malloc(maxiter*sizeof(double));
   tstep = (double *) malloc(maxiter*sizeof(double));
-
-  sendn = (double *) malloc(msgsize);
-  sends = (double *) malloc(msgsize);
-  sende = (double *) malloc(msgsize);
-  sendw = (double *) malloc(msgsize);
-  recvn = (double *) malloc(msgsize);
-  recvs = (double *) malloc(msgsize);
-  recve = (double *) malloc(msgsize);
-  recvw = (double *) malloc(msgsize);
-
-  for (i = 0; i< dblcount; i++) sendn[i] = (double) myrank;
-  for (i = 0; i< dblcount; i++) sends[i] = (double) myrank;
-  for (i = 0; i< dblcount; i++) sende[i] = (double) myrank;
-  for (i = 0; i< dblcount; i++) sendw[i] = (double) myrank;
-
-  for (i = 0; i< dblcount; i++) recvn[i] = 0.0;
-  for (i = 0; i< dblcount; i++) recvs[i] = 0.0;
-  for (i = 0; i< dblcount; i++) recve[i] = 0.0;
-  for (i = 0; i< dblcount; i++) recvw[i] = 0.0;
-
-  if (method == ALLTOALL) {
-     sbuf = (double *) malloc(msgsize*npey);
-     rbuf = (double *) malloc(msgsize*npey);
-     for (i = 0; i< dblcount*npey; i++) sbuf[i] = (double) myrank;
-     for (i = 0; i< dblcount*npey; i++) rbuf[i] = 0.0;
-  }
 
   xrand = (double *) malloc(nrand*sizeof(double));
 
@@ -310,7 +295,6 @@ int main(int argc, char * argv[])
   srand48(13579L);
   for (i = 0; i < nrand; i++) xrand[i] = drand48();
 
-#ifdef GPU
  // allocate GPU data
   CUDA_RC(cudaMalloc((void **)&dev_xrand, nrand*sizeof(double)));
   CUDA_RC(cudaMalloc((void **)&dev_block_data, MAX_BLOCKS*sizeof(double)));
@@ -319,14 +303,10 @@ int main(int argc, char * argv[])
 
   // copy data to the GPU one time
   CUDA_RC(cudaMemcpy(dev_xrand, xrand, nrand*sizeof(double),  cudaMemcpyHostToDevice));
-#endif
 
   // initial guess for how many outer iterations of the compute kernel
-#ifdef GPU
-  npts = (long) ( 4.0e10 * compute_interval_msec / 125.0 );
-#else
-  npts = (long) ( 2.0e7  * compute_interval_msec / 125.0 ); 
-#endif
+  npts = (long) ( 2.0e10 * compute_interval_msec / 125.0 );
+
   ssum = 0.0;
 
   calib_iters = (int) ( 200.0 * 50.0 / compute_interval_msec );
@@ -334,22 +314,22 @@ int main(int argc, char * argv[])
   MPI_Barrier(MPI_COMM_WORLD);
 
   // make one call that is not timed
-#ifdef GPU
-  int threadsPerBlock = THREADS_PER_BLOCK;
-  int numBlocks = (npts + threadsPerBlock - 1) / threadsPerBlock;
+  threadsPerBlock = THREADS_PER_BLOCK;
+  numBlocks = (npts + threadsPerBlock - 1) / threadsPerBlock;
   if (numBlocks > MAX_BLOCKS) numBlocks = MAX_BLOCKS;
   gpu_compute<<<numBlocks, threadsPerBlock>>>(kernel, npts, nrand, dev_xrand, dev_block_data);
   CUDA_RC(cudaMemcpy(block_data, dev_block_data, numBlocks*sizeof(double), cudaMemcpyDeviceToHost));
   for (int j = 0; j < numBlocks; j++)  ssum += block_data[j];
-#else
-  compute(kernel, npts, nrand, xrand, &ssum);
-  ssum += 1.0;
-#endif
 
-  if (method == EXCHANGE)       exch(0);
-  else if (method == ALLTOALL)  MPI_Alltoall(sbuf, dblcount, MPI_DOUBLE, rbuf, dblcount, MPI_DOUBLE, column_comm);
-  else if (method == ALLREDUCE) MPI_Allreduce(MPI_IN_PLACE, &ssum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-  else                          MPI_Barrier(MPI_COMM_WORLD);
+  if      (method == EXCHANGE) exch(0);
+  else if (method == BARRIER) {
+     MPI_Barrier(MPI_COMM_WORLD);
+     CUDA_RC(cudaMemcpy(hbuf, rbuf, xfersize, cudaMemcpyDeviceToHost));
+  }
+  else if (method == ALLREDUCE) {
+       NCCL_RC(ncclAllReduce(sbuf, rbuf, nfloats, ncclFloat, ncclSum, nccl_comm, stream));
+       CUDA_RC(cudaStreamSynchronize(stream));
+  }
 
   if (myrank == 0) printf("calibrating compute time ..\n");
 
@@ -359,14 +339,9 @@ int main(int argc, char * argv[])
   // compute for long enough to ramp up power
   t1 = MPI_Wtime();
   for (i = 0; i < calib_iters ; i++) {
-#ifdef GPU
     gpu_compute<<<numBlocks, threadsPerBlock>>>(kernel, npts, nrand, dev_xrand, dev_block_data);
     CUDA_RC(cudaMemcpy(block_data, dev_block_data, numBlocks*sizeof(double), cudaMemcpyDeviceToHost));
     for (int j = 0; j < numBlocks; j++)  ssum += block_data[j];
-#else
-    compute(kernel, npts, nrand, xrand, &ssum);
-    ssum += 1.0;
-#endif
   }
   t2 = MPI_Wtime();
   tmin = (t2 - t1)/((double) calib_iters);
@@ -388,14 +363,9 @@ int main(int argc, char * argv[])
   MPI_Barrier(MPI_COMM_WORLD);
   t1 = MPI_Wtime();
   for (i = 0; i < calib_iters ; i++) {
-#ifdef GPU
     gpu_compute<<<numBlocks, threadsPerBlock>>>(kernel, npts, nrand, dev_xrand, dev_block_data);
     CUDA_RC(cudaMemcpy(block_data, dev_block_data, numBlocks*sizeof(double), cudaMemcpyDeviceToHost));
     for (int j = 0; j < numBlocks; j++)  ssum += block_data[j];
-#else
-    compute(kernel, npts, nrand, xrand, &ssum);
-    ssum += 1.0;
-#endif
   }
   t2 = MPI_Wtime();
   tmin = (t2 - t1)/((double) calib_iters);
@@ -416,9 +386,7 @@ int main(int argc, char * argv[])
   context_switches_initial = RU.ru_nivcsw;
   usr_cpu_initial          = RU.ru_utime.tv_sec + 1.0e-6*RU.ru_utime.tv_usec;
 
-#ifdef GPU
   nvml_iter = maxiter/2;
-#endif
 
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -432,7 +400,6 @@ int main(int argc, char * argv[])
   for (iter = 0; iter < maxiter; iter++) {
     if ( barrier_flag && ((iter + 1) % 100 == 0) ) MPI_Barrier(MPI_COMM_WORLD);
     t1 = MPI_Wtime();
-#ifdef GPU
     gpu_compute<<<numBlocks, threadsPerBlock>>>(kernel, npts, nrand, dev_xrand, dev_block_data);
     if (iter == nvml_iter) {
        usleep(sleep_microsec);
@@ -442,15 +409,17 @@ int main(int argc, char * argv[])
     }
     CUDA_RC(cudaMemcpy(block_data, dev_block_data, numBlocks*sizeof(double), cudaMemcpyDeviceToHost));
     for (int j = 0; j < numBlocks; j++)  ssum += block_data[j];
-#else
-    compute(kernel, npts, nrand, xrand, &ssum);
-    ssum += 1.0;
-#endif
     t2 = MPI_Wtime();
-    if (method == EXCHANGE)       exch(iter);
-    else if (method == ALLTOALL)  MPI_Alltoall(sbuf, dblcount, MPI_DOUBLE, rbuf, dblcount, MPI_DOUBLE, column_comm);
-    else if (method == ALLREDUCE) MPI_Allreduce(MPI_IN_PLACE, &ssum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    else                          MPI_Barrier(MPI_COMM_WORLD);
+    if      (method == EXCHANGE) exch(iter);
+    else if (method == BARRIER) {
+       MPI_Barrier(MPI_COMM_WORLD);
+       CUDA_RC(cudaMemcpy(hbuf, rbuf, xfersize, cudaMemcpyDeviceToHost));
+    }
+    else if (method == ALLREDUCE) {
+       NCCL_RC(ncclAllReduce(sbuf, rbuf, nfloats, ncclFloat, ncclSum, nccl_comm, stream));
+       CUDA_RC(cudaStreamSynchronize(stream));
+       CUDA_RC(cudaMemcpy(hbuf, rbuf, xfersize, cudaMemcpyDeviceToHost));
+    }
     t3 = MPI_Wtime();
     tcomp[iter] = t2 - t1;
     tcomm[iter] = t3 - t2;
@@ -499,7 +468,6 @@ int main(int argc, char * argv[])
   all_context_switches = (long *) malloc(nranks*sizeof(long));
   all_cpus = (int *) malloc(nranks*sizeof(int));
 
-#ifdef GPU
   alltemp  = (int *) malloc(nranks*sizeof(int));
   allpower = (int *) malloc(nranks*sizeof(int));
   allfreq  = (int *) malloc(nranks*sizeof(int));
@@ -507,7 +475,6 @@ int main(int argc, char * argv[])
   MPI_Gather(&temperature, 1, MPI_INT, alltemp,  1, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Gather(&power,       1, MPI_INT, allpower, 1, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Gather(&smMHz,       1, MPI_INT, allfreq,  1, MPI_INT, 0, MPI_COMM_WORLD);
-#endif
 
   mycpu = sched_getcpu();
 
@@ -670,7 +637,7 @@ int main(int argc, char * argv[])
      if (tstep[iter] < tmin) tmin = tstep[iter];
   }
 
-  if ( (method == ALLREDUCE) || (method == BARRIER) ) {
+  if (method == ALLREDUCE || method == BARRIER) {
      // in this case there is just one step time per iteration, the same for all ranks
      tavg = (elapsed2 - elapsed1) / ((double) maxiter);
      
@@ -747,8 +714,8 @@ int main(int argc, char * argv[])
     if ((bin >= 0) && (bin < totbins)) histo[bin]++;
   }
 
-  // for the exchange or alltoall methods, we should sum over all MPI ranks
-  if ( (method == EXCHANGE) || (method == ALLTOALL) ) {
+  // for the exchange method, we should sum over all MPI ranks
+  if (method == EXCHANGE) {
      MPI_Allreduce(MPI_IN_PLACE, histo, totbins, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
   }
 
@@ -841,34 +808,19 @@ int main(int argc, char * argv[])
     printf("min MPI time = %.3lf sec for rank %d\n", minMPI.value, minMPI.index);
     printf("avg MPI time = %.3lf sec\n", avgMPI);
     printf("\n");
-#ifdef GPU
     printf("avg compute interval (msec) and percent relative variation by rank:\n");
     sprintf(hfmt, "%%s %%%ds", maxlen);
     sprintf(heading, hfmt, "  rank", "host");
-    strcat(heading, "    gpu  <compute(msec)> %%variation temp  power  freq\n");
+    strcat(heading, "    gpu  <compute(msec)> %%variation total_comm(sec)  switches    temp  power  freq\n");
     printf(heading);
-    sprintf(format, "%%6d %%%ds %%4d %%12.3lf    %%10.2lf     %%d %%6d %%6d", maxlen);
+    sprintf(format, "%%6d %%%ds %%4d %%12.3lf    %%10.2lf    %%10.2lf  %%10d %%9d %%6d %%6d", maxlen);
     strcat(format, "\n");
     for (i=0; i<nranks; i++) {
        k = i / numDevices;
        ptr = rnames + k*sizeof(host);
        gpu = i % numDevices;
-       printf(format, i, ptr, gpu, 1.0e3*allavg_comp[i], alldev_comp[i], alltemp[i], allpower[i]/1000, allfreq[i]);
+       printf(format, i, ptr, gpu, 1.0e3*allavg_comp[i], alldev_comp[i], allsum_comm[i], all_context_switches[i],  alltemp[i], allpower[i]/1000, allfreq[i]);
     }    
-#else
-    printf("avg compute interval (msec), percent relative variation of compute times, and total communication time (sec) by rank:\n");
-    sprintf(hfmt, "%%s %%%ds", maxlen);
-    sprintf(heading, hfmt, "  rank", "host");
-    strcat(heading, "    cpu  avg_comp(msec)    %%reldev   total_comm(sec)   user_time(sec)   switches\n");
-    printf(heading);
-    sprintf(format, "%%6d %%%ds %%6d %%14.3lf  %%10.2lf %%16.3lf %%16.3lf %%11ld", maxlen);
-    strcat(format, "\n");
-    for (i=0; i<nranks; i++) {
-       k = i / ranks_per_node;
-       ptr = rnames + k*sizeof(host);
-       printf(format, i, ptr, all_cpus[i], 1.0e3*allavg_comp[i], alldev_comp[i], allsum_comm[i], allusr_time[i], all_context_switches[i]);
-    }
-#endif
     printf("\n");
   }
 
@@ -883,57 +835,47 @@ int main(int argc, char * argv[])
 // -----------------------------------
 void exch(int iter)
 {
-  int ireq, tag, north, south, east, west;
-  MPI_Request req[8];
-  MPI_Status status[8];
+  int north, south, east, west;
 
-  ireq = 0;
-
-  tag = 99 + 20*iter;
+  NCCL_RC(ncclGroupStart());
 
   // exchange data with partner to the north
   if (myrow != (npey - 1)) {
     north = myrank + npex;
-    MPI_Irecv(recvn, dblcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
-    MPI_Isend(sendn, dblcount, MPI_DOUBLE, north, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
+    NCCL_RC(ncclSend(sbuf, nfloats, ncclFloat, north, nccl_comm, stream));
+    NCCL_RC(ncclRecv(rbuf, nfloats, ncclFloat, north, nccl_comm, stream));
   }
 
   // exchange data with partner to the east
   if (mycol != (npex - 1)) {
     east = myrank + 1;
-    MPI_Irecv(recve, dblcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
-    MPI_Isend(sende, dblcount, MPI_DOUBLE, east, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
+    NCCL_RC(ncclSend(sbuf, nfloats, ncclFloat, east, nccl_comm, stream));
+    NCCL_RC(ncclRecv(rbuf, nfloats, ncclFloat, east, nccl_comm, stream));
   }
 
   // exchange data with partner to the south
   if (myrow != 0) {
     south = myrank - npex;
-    MPI_Irecv(recvs, dblcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
-    MPI_Isend(sends, dblcount, MPI_DOUBLE, south, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
+    NCCL_RC(ncclSend(sbuf, nfloats, ncclFloat, south, nccl_comm, stream));
+    NCCL_RC(ncclRecv(rbuf, nfloats, ncclFloat, south, nccl_comm, stream));
   }
 
   // exchange data with partner to the west
   if (mycol != 0) {
     west = myrank - 1;
-    MPI_Irecv(recvw, dblcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
-    MPI_Isend(sendw, dblcount, MPI_DOUBLE, west, tag, MPI_COMM_WORLD, &req[ireq]);
-    ireq = ireq + 1;
+    NCCL_RC(ncclSend(sbuf, nfloats, ncclFloat, west, nccl_comm, stream));
+    NCCL_RC(ncclRecv(rbuf, nfloats, ncclFloat, west, nccl_comm, stream));
   }
 
-  MPI_Waitall(ireq, req, status);
+  NCCL_RC(ncclGroupEnd());
+  CUDA_RC(cudaStreamSynchronize(stream));
+
+  CUDA_RC(cudaMemcpy(hbuf, rbuf, xfersize, cudaMemcpyDeviceToHost));
 
   return;
   
 }
 
-#ifdef GPU
 // -----------------------------------
 // routine for computation
 // -----------------------------------
@@ -979,36 +921,6 @@ __global__ void gpu_compute(int flag, long n, int nrand, double * xrand, double 
   if (threadIdx.x == 0) out[blockIdx.x] = tsum;
 
 }
-#else
-// -----------------------------------
-// routine for computation
-// -----------------------------------
-void compute(int flag, long n, int nrand, double * xrand, double * ssum)
-{
-  double tsum;
-  long i, lrand, ndx;
-
-  lrand = (long) nrand;
-  
-  tsum = 0.0;
-
-  if (flag) {
-    for (i = 0L; i < n; i++) {
-      ndx = i % lrand;
-      tsum = tsum + lutexp(xrand[ndx]);
-    }
-  }
-  else {
-    for (i = 0L; i < n; i++) {
-      ndx = i % lrand;
-      tsum = tsum + sqrt(1.0 + xrand[ndx]);
-    }
-  }
-
-  *ssum = tsum;
-
-}
-#endif
 
 // -----------------------------------
 // help message
@@ -1019,8 +931,9 @@ void print_help(void)
    printf(" -c float ... specifies the compute interval in milliseconds\n");
    printf(" -t int   ... specifies the target measurement time in units of seconds\n");
    printf(" -n int   ... specifies the number of histogram bins per decade\n");
-   printf(" -x int   ... specifies the message size in bytes used for neighbor exchange or alltoall\n");
-   printf(" -m char  ... specifies the communication method (values : exchange, alltoall, allreduce, barrier)\n");
+   printf(" -s int   ... specifies the message size in bytes used for neighbor exchange or allreduce\n");
+   printf(" -x int   ... specifies the size in bytes used for device to host transfer\n");
+   printf(" -m char  ... specifies the communication method (values : exchange or allreduce)\n");
    printf(" -k char  ... specifies the compute kernel (values : sqrt, lut)\n");
    printf(" -d       ... sets flag to dump data to a file\n");
    printf(" -b       ... sets flag to add a barrier every 100 iterations of the (compute, communicate) loop\n");    
