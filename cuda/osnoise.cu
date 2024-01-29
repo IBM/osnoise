@@ -95,7 +95,7 @@ int main(int argc, char * argv[])
   int num_nodes, color, key;
   float alpha;
   double * compmax, compmin, compavg, compssq;
-  double sigma_comp, samples_total;
+  double sigma_comp, samples_total, local_samples, local_compavg;
   double * aggregate_sigma_comp, * aggregate_compavg;
   double mean_comp, * alldev_comp, * allavg_comp;
   double sum_comm, * allsum_comm;
@@ -551,17 +551,19 @@ int main(int argc, char * argv[])
   // find the max compute time for each iteration on a per-node basis
   MPI_Allreduce(tcomp, compmax, maxiter, MPI_DOUBLE, MPI_MAX, local_comm);
 
-  // find the global avg time for computation
+  // find the local and global avg time for computation
   compavg = 0.0;
   for (iter = 0; iter < maxiter; iter++) compavg += tcomp[iter];
 
+  MPI_Allreduce(&compavg, &local_compavg, 1, MPI_DOUBLE, MPI_SUM, local_comm);
+  local_samples = ((double) maxiter) * ((double) ranks_per_node);
+  local_compavg = local_compavg / local_samples;
+
   MPI_Allreduce(MPI_IN_PLACE, &compavg, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
   samples_total = ((double) maxiter) * ((double) nranks);
-
   compavg = compavg / samples_total;
 
-  // look at the max computation times per iteration for analysis by node
+  // look at the node-local max computation time per iteration relative to the global avg for analysis by node
   compssq = 0.0;
   for (iter = 0; iter < maxiter; iter++) {
     dev = compmax[iter] - compavg;
@@ -588,7 +590,7 @@ int main(int argc, char * argv[])
      aggregate_compavg    = (double *) malloc(num_nodes*sizeof(double));
 
      MPI_Allgather(&sigma_comp, 1, MPI_DOUBLE, aggregate_sigma_comp, 1, MPI_DOUBLE, node_comm);
-     MPI_Allgather(&compavg,    1, MPI_DOUBLE, aggregate_compavg,    1, MPI_DOUBLE, node_comm);
+     MPI_Allgather(&local_compavg, 1, MPI_DOUBLE, aggregate_compavg, 1, MPI_DOUBLE, node_comm);
 
      snames = (char *) malloc(num_nodes*sizeof(host));
      rnames = (char *) malloc(num_nodes*sizeof(host));
