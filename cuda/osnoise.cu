@@ -65,7 +65,7 @@ int main(int argc, char * argv[])
   long npts, context_switches, context_switches_initial;
   long * all_context_switches;
   double  ssum, xtraffic, ytraffic, data_volume, bw;
-  double  t1, t2, t3, tmin, tmax;
+  double  t1, t2, t3, tmin, tmax, local_tmax;
   double * xrand;
   int nrand = 1000;
   int local_rank, ranks_per_node;
@@ -96,7 +96,7 @@ int main(int argc, char * argv[])
   float alpha;
   double * compmax, compmin, compavg, compssq;
   double sigma_comp, samples_total, local_samples, local_compavg;
-  double * aggregate_sigma_comp, * aggregate_compavg;
+  double * aggregate_sigma_comp, * aggregate_compavg, * aggregate_tmax;
   double mean_comp, * alldev_comp, * allavg_comp;
   double sum_comm, * allsum_comm;
   double usr_cpu_initial, usr_cpu_final, usr_time, * allusr_time;
@@ -258,7 +258,7 @@ int main(int argc, char * argv[])
   // for use in nvml queries
   nvmldevice = device[myDevice];
 
-  sleep_microsec = (int) (0.8*compute_interval_msec * 1.0e3);
+  sleep_microsec = (int) (0.5*compute_interval_msec * 1.0e3);
 
   if (myrank == 0) {
      if (method == EXCHANGE) {
@@ -299,13 +299,13 @@ int main(int argc, char * argv[])
   CUDA_RC(cudaMalloc((void **)&dev_xrand, nrand*sizeof(double)));
   CUDA_RC(cudaMalloc((void **)&dev_block_data, MAX_BLOCKS*sizeof(double)));
 
-  block_data = (double *) malloc(MAX_BLOCKS*sizeof(double));
+  CUDA_RC(cudaMallocHost((void **)&block_data, MAX_BLOCKS*sizeof(double)));
 
   // copy data to the GPU one time
   CUDA_RC(cudaMemcpy(dev_xrand, xrand, nrand*sizeof(double),  cudaMemcpyHostToDevice));
 
   // initial guess for how many outer iterations of the compute kernel
-  npts = (long) ( 2.0e10 * compute_interval_msec / 125.0 );
+  npts = (long) ( 3.0e10 * compute_interval_msec / 125.0 );
 
   ssum = 0.0;
 
@@ -330,6 +330,10 @@ int main(int argc, char * argv[])
        NCCL_RC(ncclAllReduce(sbuf, rbuf, nfloats, ncclFloat, ncclSum, nccl_comm, stream));
        CUDA_RC(cudaStreamSynchronize(stream));
   }
+
+  if (NVML_SUCCESS != nvmlDeviceGetTemperature(nvmldevice, NVML_TEMPERATURE_GPU, &temperature)) temperature = 0;   
+  if (NVML_SUCCESS != nvmlDeviceGetPowerUsage(nvmldevice, &power)) power = 0; 
+  if (NVML_SUCCESS != nvmlDeviceGetClockInfo(nvmldevice, NVML_CLOCK_SM, &smMHz)) smMHz = 0; 
 
   if (myrank == 0) printf("calibrating compute time ..\n");
 
@@ -537,7 +541,6 @@ int main(int argc, char * argv[])
 
   free(histo);
 
-  // for per-node analysis, focus on the compute times
   compmax = (double *) malloc(maxiter*sizeof(double));
 
   // find the global minimum computation time over all iterations
@@ -553,7 +556,13 @@ int main(int argc, char * argv[])
 
   // find the local and global avg time for computation
   compavg = 0.0;
-  for (iter = 0; iter < maxiter; iter++) compavg += tcomp[iter];
+  for (iter = 0; iter < maxiter; iter++) {
+    compavg += tcomp[iter];
+    if (tcomp[iter] > local_tmax) local_tmax = tcomp[iter];
+  }
+  
+  // find the node-local maximum step time
+  MPI_Allreduce(MPI_IN_PLACE, &local_tmax, 1, MPI_DOUBLE, MPI_MAX, local_comm);
 
   MPI_Allreduce(&compavg, &local_compavg, 1, MPI_DOUBLE, MPI_SUM, local_comm);
   local_samples = ((double) maxiter) * ((double) ranks_per_node);
@@ -584,13 +593,16 @@ int main(int argc, char * argv[])
   hostlen = strlen(host);
   MPI_Allreduce(&hostlen, &maxlen, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
+  // for per-node analysis, focus on the compute times
   if (local_rank == 0) {
 
      aggregate_sigma_comp = (double *) malloc(num_nodes*sizeof(double));
      aggregate_compavg    = (double *) malloc(num_nodes*sizeof(double));
+     aggregate_tmax       = (double *) malloc(num_nodes*sizeof(double));
 
      MPI_Allgather(&sigma_comp, 1, MPI_DOUBLE, aggregate_sigma_comp, 1, MPI_DOUBLE, node_comm);
      MPI_Allgather(&local_compavg, 1, MPI_DOUBLE, aggregate_compavg, 1, MPI_DOUBLE, node_comm);
+     MPI_Allgather(&local_tmax, 1, MPI_DOUBLE, aggregate_tmax, 1, MPI_DOUBLE, node_comm);
 
      snames = (char *) malloc(num_nodes*sizeof(host));
      rnames = (char *) malloc(num_nodes*sizeof(host));
@@ -609,8 +621,8 @@ int main(int argc, char * argv[])
 
      sprintf(hfmt, "%%%ds", maxlen);
      sprintf(heading, hfmt, "host");
-     strcat(heading, "         mean(msec)    percent variation\n");
-     sprintf(format, "%%%ds    %%10.3lf    %%10.3lf", maxlen);
+     strcat(heading, "         mean(msec)    max(msec)   percent variation\n");
+     sprintf(format, "%%%ds    %%10.3lf    %%10.3lf    %%10.3lf", maxlen);
      strcat(format, "\n");
 
      if (myrank == 0) {
@@ -621,7 +633,7 @@ int main(int argc, char * argv[])
            k = sort_key[i];
            ptr = rnames + k*sizeof(host);
            relative_variation = 100.0*aggregate_sigma_comp[i] / aggregate_compavg[k];
-           printf(format, ptr, 1.0e3*aggregate_compavg[k], relative_variation);
+           printf(format, ptr, 1.0e3*aggregate_compavg[k], 1.0e3*aggregate_tmax[k], relative_variation);
         }
         printf("\n");
      }
@@ -631,13 +643,6 @@ int main(int argc, char * argv[])
   memset(heading, '\0', sizeof(heading));
   memset(format, '\0', sizeof(format));
   
-
-  // analyze all step time data for all ranks
-  tmin = 1.0e30; tmax = 0.0;
-  for (iter = 0; iter < maxiter; iter++) {
-     if (tstep[iter] > tmax) tmax = tstep[iter];
-     if (tstep[iter] < tmin) tmin = tstep[iter];
-  }
 
   if (method == ALLREDUCE || method == BARRIER) {
      // in this case there is just one step time per iteration, the same for all ranks
@@ -688,6 +693,13 @@ int main(int argc, char * argv[])
   skewness = scb / (samples * sigma * sigma * sigma);
 
   kurtosis = sp4 / (samples * sigma * sigma * sigma * sigma);
+
+  // analyze all step time data for all ranks
+  tmin = 1.0e30; tmax = 0.0;
+  for (iter = 0; iter < maxiter; iter++) {
+     if (tstep[iter] > tmax) tmax = tstep[iter];
+     if (tstep[iter] < tmin) tmin = tstep[iter];
+  }
 
   // find the global min and max step times
   MPI_Allreduce(MPI_IN_PLACE, &tmin, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
