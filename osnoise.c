@@ -237,8 +237,8 @@ int main(int argc, char * argv[])
   for (i = 0; i< dblcount; i++) recvw[i] = 0.0;
 
   if (method == ALLTOALL) {
-     sbuf = (double *) malloc(msgsize*npey);
-     rbuf = (double *) malloc(msgsize*npey);
+     sbuf = (double *) malloc(((size_t) msgsize)*((size_t) npey));
+     rbuf = (double *) malloc(((size_t) msgsize)*((size_t) npey));
      for (i = 0; i< dblcount*npey; i++) sbuf[i] = (double) myrank;
      for (i = 0; i< dblcount*npey; i++) rbuf[i] = 0.0;
   }
